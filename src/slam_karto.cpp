@@ -40,6 +40,9 @@
 
 #include "spa_solver.h"
 
+#include <dynamic_reconfigure/server.h>
+#include <slam_karto/SlamKartoConfig.h>
+
 #include <boost/thread.hpp>
 
 #include <string>
@@ -60,6 +63,7 @@ class SlamKarto
                      nav_msgs::GetMap::Response &res);
 
   private:
+    void reconfigureCallback(slam_karto::SlamKartoConfig &config, uint32_t level);
     bool getOdomPose(karto::Pose2& karto_pose, const ros::Time& t);
     karto::LaserRangeFinder* getLaser(const sensor_msgs::LaserScan::ConstPtr& scan);
     bool addScan(karto::LaserRangeFinder* laser,
@@ -91,8 +95,11 @@ class SlamKarto
     int throttle_scans_;
     ros::Duration map_update_interval_;
     double resolution_;
+    int min_pass_through_;
+    double occupancy_threshold_;
     boost::mutex map_mutex_;
     boost::mutex map_to_odom_mutex_;
+    dynamic_reconfigure::Server<slam_karto::SlamKartoConfig> dynamic_reconfigure_server_;
 
     // Karto bookkeeping
     karto::Mapper* mapper_;
@@ -138,6 +145,10 @@ SlamKarto::SlamKarto() :
     if(!private_nh_.getParam("delta", resolution_))
       resolution_ = 0.05;
   }
+  if(!private_nh_.getParam("min_pass_through", min_pass_through_))
+    min_pass_through_ = 2; // this is the default in SlamKarto::OccupancyGrid
+  if(!private_nh_.getParam("occupancy_threshold", occupancy_threshold_))
+    occupancy_threshold_ = 0.1; // this is the default in SlamKarto::OccupancyGrid
   double transform_publish_period;
   private_nh_.param("transform_publish_period", transform_publish_period, 0.05);
 
@@ -282,6 +293,8 @@ SlamKarto::SlamKarto() :
   // Set solver to be used in loop closure
   solver_ = new SpaSolver();
   mapper_->SetScanSolver(solver_);
+
+  dynamic_reconfigure_server_.setCallback(boost::bind(&SlamKarto::reconfigureCallback, this, _1, _2));
 }
 
 SlamKarto::~SlamKarto()
@@ -407,6 +420,27 @@ SlamKarto::getLaser(const sensor_msgs::LaserScan::ConstPtr& scan)
   }
 
   return lasers_[scan->header.frame_id];
+}
+
+void
+SlamKarto::reconfigureCallback(slam_karto::SlamKartoConfig &config, uint32_t level) {
+  ROS_INFO("Reconfiguring SlamKarto.");
+  bool update_map = false;
+  if (resolution_ != config.resolution ||
+      min_pass_through_ != config.min_pass_through ||
+      occupancy_threshold_ != config.occupancy_threshold)
+  {
+    update_map = true;
+  }
+
+  resolution_ = config.resolution;
+  min_pass_through_ = config.min_pass_through;
+  occupancy_threshold_ = config.occupancy_threshold;
+
+  if (update_map)
+  {
+    updateMap();
+  }
 }
 
 bool
@@ -563,21 +597,19 @@ SlamKarto::updateMap()
   boost::mutex::scoped_lock(map_mutex_);
 
   karto::OccupancyGrid* occ_grid = 
-          karto::OccupancyGrid::CreateFromScans(mapper_->GetAllProcessedScans(), resolution_);
+          karto::OccupancyGrid::CreateFromScans(mapper_->GetAllProcessedScans(), resolution_, min_pass_through_, occupancy_threshold_);
 
   if(!occ_grid)
     return false;
 
-  if(!got_map_) {
-    map_.map.info.resolution = resolution_;
-    map_.map.info.origin.position.x = 0.0;
-    map_.map.info.origin.position.y = 0.0;
-    map_.map.info.origin.position.z = 0.0;
-    map_.map.info.origin.orientation.x = 0.0;
-    map_.map.info.origin.orientation.y = 0.0;
-    map_.map.info.origin.orientation.z = 0.0;
-    map_.map.info.origin.orientation.w = 1.0;
-  } 
+  map_.map.info.resolution = resolution_;
+  map_.map.info.origin.position.x = 0.0;
+  map_.map.info.origin.position.y = 0.0;
+  map_.map.info.origin.position.z = 0.0;
+  map_.map.info.origin.orientation.x = 0.0;
+  map_.map.info.origin.orientation.y = 0.0;
+  map_.map.info.origin.orientation.z = 0.0;
+  map_.map.info.origin.orientation.w = 1.0;
 
   // Translate to ROS format
   kt_int32s width = occ_grid->GetWidth();
